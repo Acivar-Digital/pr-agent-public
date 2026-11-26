@@ -1,0 +1,19 @@
+{
+  "profile": "wsl-dev",
+  "environment": "dev",
+  "host": "127.0.0.1",
+  "port": 8446,
+  "parent_dir": "arthityap",
+  "working_folder": "pr-agent-vps",
+  "peer": {
+    "environment": "production",
+    "ssh_host": "your-vps-host",
+    "root": "<install-dir>",
+    "host": "127.0.0.1",
+    "port": 8446
+  },
+  "testing": {
+    "test_port": 8455,
+    "test_base_url": "http://127.0.0.1:8455"
+  }
+}

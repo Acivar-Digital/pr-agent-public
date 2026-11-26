@@ -1,0 +1,27 @@
+.env
+.env.*
+!.env.example
+config/location.json
+.cloudflared-token
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+data/
+workspaces/
+
+# Local graph analysis artifacts (regenerate with graphify; never commit).
+graphify-out/
+
+# Operator deploy script — machine-specific by design.
+# Tracked baseline: admin/sync.sh.example. See admin/README.md.
+admin/sync.sh
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+# Passive bd export — local artifact, not the cross-machine wire protocol.
+.beads/issues.jsonl
+*.gate.lock*

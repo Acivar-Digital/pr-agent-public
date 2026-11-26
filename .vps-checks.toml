@@ -1,0 +1,14 @@
+# Repo verification checks (Stage 2). Loaded from MAIN only, never the PR head.
+# Each argv runs with shell=False, a minimal offline env (no secrets, UV_OFFLINE=1),
+# and process-group isolation. --no-sync/--offline stop `uv run` from syncing or
+# building untrusted PR dependencies.
+
+[[checks]]
+name = "ruff"
+argv = ["uv", "run", "--no-sync", "--offline", "ruff", "check", "."]
+timeout_seconds = 120
+
+[[checks]]
+name = "ty"
+argv = ["uv", "run", "--no-sync", "--offline", "ty", "check"]
+timeout_seconds = 180

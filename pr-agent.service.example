@@ -1,0 +1,17 @@
+[Unit]
+Description=PR Agent REST API
+After=network.target
+
+[Service]
+Type=simple
+User=<your-user>
+WorkingDirectory=/srv/pr-agent-vps
+EnvironmentFile=/srv/pr-agent-vps/.env
+# `python -m server` resolves host/port from config/location.json, so the bind
+# address cannot drift from the deployed config.
+ExecStart=/home/<your-user>/.local/bin/uv run python -m server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

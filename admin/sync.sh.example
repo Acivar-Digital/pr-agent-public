@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+#
+# One-way deploy: dev -> production.
+#
+# Target comes from config/location.json (peer.ssh_host, peer.root, peer.port) so
+# there is exactly one authority for "where is production".
+#
+# The remote side is fail-closed: it refuses a dirty tree, seeds a missing
+# config/location.json, verifies the resolved environment, runs the test suite,
+# restarts the unit, and gates on /health. Any step failing aborts the deploy.
+#
+#   ./admin/sync.sh --dry-run   # print the remote script, touch nothing
+#   ./admin/sync.sh             # deploy
+#
+# GITIGNORED. This is the operator's live copy; local tweaks stay out of review.
+# The tracked baseline is admin/sync.sh.example. See admin/README.md.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOC="$REPO_ROOT/config/location.json"
+SERVICE="${PR_AGENT_SERVICE:-pr-agent.service}"
+SCOPE="${PR_AGENT_SYSTEMCTL_SCOPE:---user}"
+
+DRY_RUN=0
+if [ "${1:-}" = "--dry-run" ]; then
+  DRY_RUN=1
+elif [ $# -gt 0 ]; then
+  echo "sync: unknown argument: $1" >&2
+  exit 2
+fi
+
+die() { echo "sync: $*" >&2; exit 1; }
+
+# --- guards ----------------------------------------------------------------
+
+[ -f "$LOC" ] || die "missing $LOC (copy config/location.json.example)"
+
+# Environment is derived from the filesystem, never trusted from the file. This
+# guard deliberately does not call server.location: the deploy path must still
+# refuse correctly when the code it is about to ship is broken.
+case "$(basename "$(dirname "$REPO_ROOT")")" in
+  services)  LOCAL_ENV=production ;;
+  arthityap) LOCAL_ENV=dev ;;
+  *)         LOCAL_ENV=unknown ;;
+esac
+
+# One-way. There is no reverse path.
+[ "$LOCAL_ENV" = dev ] ||
+  die "refusing: local environment is '$LOCAL_ENV'; this deploys dev -> production only"
+
+# Resolve the peer through the application's own loader so the local config is
+# validated by the same rules the server will use, not a second JSON reader.
+echo "sync: verifying local identity ($(basename "$REPO_ROOT"))"
+(cd "$REPO_ROOT" && uv run python -m server.location) ||
+  die "local $LOC is missing or invalid"
+
+PEER_FIELDS="$(
+  cd "$REPO_ROOT" && uv run python - <<'PY'
+from server.location import load_location
+
+peer = load_location().peer
+print(peer.environment, peer.ssh_host or "", peer.root, peer.port)
+PY
+)" || die "could not read peer from $LOC"
+
+read -r PEER_ENV PEER_HOST PEER_ROOT PEER_PORT <<< "$PEER_FIELDS"
+
+[ -n "$PEER_HOST" ] || die "peer.ssh_host missing in $LOC"
+[ -n "$PEER_ROOT" ] || die "peer.root missing in $LOC"
+[ -n "$PEER_PORT" ] || die "peer.port missing in $LOC"
+[ "$PEER_ENV" = production ] ||
+  die "peer.environment is '$PEER_ENV', expected 'production'"
+
+BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+{ [ -n "$BRANCH" ] && [ "$BRANCH" != HEAD ]; } ||
+  die "detached HEAD; check out a branch before deploying"
+
+# --- warn about changes that would silently not deploy ---------------------
+
+git -C "$REPO_ROOT" fetch --quiet origin || die "git fetch origin failed"
+
+if [ "$(git -C "$REPO_ROOT" rev-parse HEAD)" != \
+     "$(git -C "$REPO_ROOT" rev-parse "origin/$BRANCH")" ]; then
+  echo "sync: WARNING: local HEAD != origin/$BRANCH - unpushed commits will not deploy" >&2
+fi
+
+if ! git -C "$REPO_ROOT" diff --quiet || ! git -C "$REPO_ROOT" diff --cached --quiet; then
+  echo "sync: WARNING: uncommitted changes to tracked files will not deploy" >&2
+fi
+
+# --- remote ----------------------------------------------------------------
+
+remote_script() {
+  cat <<REMOTE
+set -euo pipefail
+cd $(printf '%q' "$PEER_ROOT") || { echo "sync: cannot cd to $PEER_ROOT" >&2; exit 1; }
+
+# Non-interactive ssh does not source the profile, so uv may be off PATH.
+UV="\$(command -v uv || true)"
+[ -n "\$UV" ] || UV="\$HOME/.local/bin/uv"
+[ -x "\$UV" ] || { echo "sync: uv not found (looked on PATH and \$HOME/.local/bin)" >&2; exit 1; }
+
+# A dirty tree makes --ff-only ambiguous and would silently deploy a mix of
+# commits. Refuse rather than guess.
+if ! git diff-index --quiet HEAD --; then
+  echo "sync: ERROR working tree has uncommitted changes:" >&2
+  git status --porcelain >&2
+  exit 1
+fi
+
+echo "sync: pulling origin $(printf '%q' "$BRANCH") on \$(hostname)"
+git pull --ff-only origin $(printf '%q' "$BRANCH")
+
+# config/location.json is untracked and never edited on the peer. Seed it once
+# from the tracked template, declaring this machine's production identity.
+if [ ! -f config/location.json ]; then
+  echo "sync: bootstrapping config/location.json"
+  # The peer root is this checkout's real path, so no machine path is hardcoded.
+  PR_AGENT_DEV_ROOT="$REPO_ROOT"
+  export PR_AGENT_DEV_ROOT
+  "\$UV" run python - <<'PY'
+import json
+import os
+import pathlib
+
+config = json.loads(pathlib.Path("config/location.json.example").read_text(encoding="utf-8"))
+config.update(
+    profile="vps-prod",
+    environment="production",
+    parent_dir="services",
+    peer={
+        "environment": "dev",
+        "ssh_host": None,
+        "root": os.environ["PR_AGENT_DEV_ROOT"],
+        "host": "127.0.0.1",
+        "port": 8446,
+    },
+)
+path = pathlib.Path("config/location.json")
+path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+print("sync: wrote " + str(path))
+PY
+fi
+
+echo "sync: verifying environment identity"
+"\$UV" run python -m server.location
+
+echo "sync: running tests"
+"\$UV" run pytest tests
+
+echo "sync: restarting $(printf '%q' "$SERVICE")"
+RESTART_TS="\$(date '+%Y-%m-%d %H:%M:%S')"
+systemctl $SCOPE restart $(printf '%q' "$SERVICE")
+
+echo "sync: waiting for the unit to become active"
+for i in \$(seq 1 30); do
+  if systemctl $SCOPE is-active --quiet $(printf '%q' "$SERVICE"); then
+    break
+  fi
+  if [ "\$i" -eq 30 ]; then
+    echo "sync: ERROR $(printf '%q' "$SERVICE") failed to start" >&2
+    systemctl $SCOPE status $(printf '%q' "$SERVICE") --no-pager >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+# Surface stop/start timestamps from the journal so the operator can see
+# exactly when the old process died and the new one came up.
+echo "sync: restart timeline (since \$RESTART_TS):"
+journalctl $SCOPE -u $(printf '%q' "$SERVICE") \
+  --since "\$RESTART_TS" --no-pager -o short-iso 2>/dev/null \
+  | grep -iE 'Stopping|Started|Stopped|Main process|Consumed' \
+  | head -20 || true
+
+# The port under test comes from the config that was actually deployed, so a
+# config/peer mismatch surfaces here instead of passing silently.
+PORT="\$("\$UV" run python -c 'from server.location import load_location; print(load_location().port)')"
+echo "sync: health check on 127.0.0.1:\$PORT"
+for i in \$(seq 1 30); do
+  if curl -fsS "http://127.0.0.1:\${PORT}/health"; then
+    echo
+    echo "sync: ok"
+    exit 0
+  fi
+  if [ "\$i" -eq 30 ]; then
+    echo "sync: ERROR health check failed after 30s" >&2
+    journalctl $SCOPE -u $(printf '%q' "$SERVICE") -n 50 --no-pager >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+REMOTE
+}
+
+if [ "$DRY_RUN" = 1 ]; then
+  echo "sync: dry run - would run on $PEER_HOST:"
+  echo "---------------------------------------------------------------"
+  remote_script
+  echo "---------------------------------------------------------------"
+  exit 0
+fi
+
+remote_script | ssh -o BatchMode=yes -o ConnectTimeout=15 "$PEER_HOST" bash

@@ -1,0 +1,44 @@
+[project]
+name = "vps-pr-agent"
+version = "0.1.0"
+description = "KISS FastMCP + agy-cli PR-Agent & Swarm Orchestrator"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "logfire[fastapi,httpx]>=3.0.0",
+    "httpx>=0.28.0",
+    "mcp>=1.8.0",
+    "pydantic>=2.10.0",
+    "pyyaml>=6.0.2",
+    "structlog>=26.1.0",
+    "fastmcp>=4.2.6",
+    "unidiff>=1.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+guard = "guard.guardrail:main"
+
+[tool.setuptools.packages.find]
+include = ["agent*", "server*", "src*", "guard*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ty.environment]
+python = ".venv"
+
+[tool.ty.rules]
+missing-direct-dependency = "error"
+possibly-unresolved-reference = "error"
+import-not-found = "error"
